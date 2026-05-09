@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from contextlib import nullcontext
 from typing import List
 
 import torch
@@ -799,6 +800,9 @@ def generate(model, input_ids, max_new_tokens, max_seq_len):
     cache_position = 0
     generated_tokens = []
 
+    if max_new_tokens <= 0:
+        return input_ids[:, :0]
+
     with torch.no_grad():
         logits = model(
             input_ids=input_ids,
@@ -815,7 +819,7 @@ def generate(model, input_ids, max_new_tokens, max_seq_len):
         generated_tokens.append(new_token)
         cache_position += prompt_len
 
-    for _ in range(max_new_tokens):
+    for _ in range(max_new_tokens - 1):
         # OOM protection
         if cache_position >= max_seq_len:
             break
@@ -835,5 +839,101 @@ def generate(model, input_ids, max_new_tokens, max_seq_len):
 
             generated_tokens.append(new_token)
             cache_position += 1
+
+    return torch.cat(generated_tokens, dim=-1)
+
+
+def generate_profiled(model, input_ids, max_new_tokens, max_seq_len, profile_decode_tokens=None, profiler=None):
+    batch_size, prompt_len = input_ids.shape
+    device = input_ids.device
+    config = model.config
+    model_dtype = model.lm_head.weight.dtype
+
+    if profile_decode_tokens is None:
+        profile_decode_tokens = max_new_tokens
+    profile_decode_tokens = max(0, min(profile_decode_tokens, max_new_tokens - 1))
+
+    # allocation phase
+    num_layers = config.num_hidden_layers
+    num_kv_heads = config.num_key_value_heads
+    head_dim = config.hidden_size // model.config.num_attention_heads
+
+    k_cache = torch.zeros(
+        batch_size, num_layers, max_seq_len, num_kv_heads, head_dim,
+        dtype=model_dtype, device=device
+    )
+    v_cache = torch.zeros(
+        batch_size, num_layers, max_seq_len, num_kv_heads, head_dim,
+        dtype=model_dtype, device=device
+    )
+
+    conv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2 + \
+           config.linear_num_value_heads * config.linear_value_head_dim
+
+    conv_cache = torch.zeros(
+        batch_size, num_layers, conv_dim, config.linear_conv_kernel_dim - 1,
+        dtype=model_dtype, device=device
+    )
+
+    recurrent_cache = torch.zeros(
+        batch_size, num_layers, config.linear_num_value_heads,
+        config.linear_key_head_dim, config.linear_value_head_dim,
+        dtype=torch.float32, device=device
+    )
+
+    cache_position = 0
+    generated_tokens = []
+
+    if max_new_tokens <= 0:
+        return input_ids[:, :0]
+
+    profiler_stopped = profiler is None
+
+    with torch.no_grad():
+        with torch.profiler.record_function("prefill"):
+            logits = model(
+                input_ids=input_ids,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                cache_position=cache_position,
+                conv_cache=conv_cache,
+                recurrent_cache=recurrent_cache,
+            )
+
+            new_token = torch.argmax(logits[:, -1:, :], dim=-1)
+            generated_tokens.append(new_token)
+            cache_position += prompt_len
+
+        for decode_step in range(max_new_tokens - 1):
+            if cache_position >= max_seq_len:
+                break
+
+            if not profiler_stopped and decode_step >= profile_decode_tokens:
+                torch.cuda.synchronize(device)
+                profiler.stop()
+                profiler_stopped = True
+
+            if decode_step < profile_decode_tokens:
+                record_context = torch.profiler.record_function(f"decode_step_{decode_step + 1}")
+            else:
+                record_context = nullcontext()
+
+            with record_context:
+                logits = model(
+                    input_ids=new_token,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    conv_cache=conv_cache,
+                    recurrent_cache=recurrent_cache,
+                    cache_position=cache_position,
+                )
+
+                new_token = torch.argmax(logits[:, -1:, :], dim=-1)
+                generated_tokens.append(new_token)
+                cache_position += 1
+
+    if not profiler_stopped:
+        torch.cuda.synchronize(device)
+        profiler.stop()
 
     return torch.cat(generated_tokens, dim=-1)
