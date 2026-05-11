@@ -38,6 +38,7 @@ image = (
         "packaging",
         "ninja",
         f"torch=={TORCH_VERSION}",
+        "triton",
         "transformers",
         "huggingface_hub",
         "safetensors",
@@ -47,10 +48,10 @@ image = (
         {
             "MAX_JOBS": "4",
             "CACHE_BUSTER": "3",
-            "CUDA_LAUNCH_BLOCKING": "1",
         }
     )
     .add_local_file("./qwen.py", remote_path="/root/qwen.py")
+    .add_local_dir("kernels/", remote_path="/root/kernels/")
 )
 
 
@@ -126,7 +127,18 @@ def load_model_weights(model, checkpoint_dir: str, logger: logging.Logger) -> No
         for key, tensor in load_file(filepath).items():
             if any(pattern in key for pattern in SKIP_WEIGHT_PATTERNS):
                 continue
-            mapped_state_dict[normalize_weight_key(key)] = tensor
+            norm_key = normalize_weight_key(key)
+            
+            if "input_layernorm.weight" in norm_key:
+                standard_key = norm_key.replace("input_layernorm.weight", "input_layernorm_standard.weight")
+                fused_key = norm_key.replace("input_layernorm.weight", "input_layernorm_fused.weight")
+                
+                mapped_state_dict[standard_key] = tensor
+                # Clone the tensor so the two modules don't share the exact same memory address
+                mapped_state_dict[fused_key] = tensor.clone() 
+                
+            else:
+                mapped_state_dict[norm_key] = tensor
 
     if "lm_head.weight" not in mapped_state_dict:
         mapped_state_dict["lm_head.weight"] = mapped_state_dict["model.embed_tokens.weight"].clone()
