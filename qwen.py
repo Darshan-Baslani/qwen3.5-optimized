@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from kernels.triton.fused_zero_centered_rmsnorm import FusedZeroCenteredRMSNorm
+
 
 def _apply_activation(x: torch.Tensor, activation: str | None) -> torch.Tensor:
     if activation is None:
@@ -556,12 +558,14 @@ class Qwen3_5DecoderLayer(nn.Module):
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3_5Attention(config, layer_idx)
         self.mlp = Qwen3_5MLP(config, config.intermediate_size)
-        self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm_standard = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm_fused = FusedZeroCenteredRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = FusedZeroCenteredRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
@@ -571,9 +575,11 @@ class Qwen3_5DecoderLayer(nn.Module):
         conv_cache: torch.Tensor | None = None,
         recurrent_cache: torch.Tensor | None = None,
     ):
-        residual = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm_standard(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm_fused(X=hidden_states, R=residual)
 
         # Token Mixer
         if self.layer_type == "linear_attention":
@@ -595,15 +601,11 @@ class Qwen3_5DecoderLayer(nn.Module):
                 cache_position=cache_position,
             )
 
-        hidden_states = residual + hidden_states
-
         # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(X=hidden_states, R=residual)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
 
-        return hidden_states
+        return hidden_states, residual
 
 
 class TextRotaryEmbedding(nn.Module):
@@ -641,7 +643,7 @@ class Qwen3_5TextModel(nn.Module):
         self.layers = nn.ModuleList(
             [Qwen3_5DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = FusedZeroCenteredRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = TextRotaryEmbedding(config=config)
 
     def forward(
@@ -671,18 +673,21 @@ class Qwen3_5TextModel(nn.Module):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
+        residual = None
         for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             if self.config.layer_types[i] == "linear_attention":
-                hidden_states = decoder_layer(
+                hidden_states, residual = decoder_layer(
                     hidden_states,
+                    residual,
                     position_embeddings=position_embeddings,
                     cache_position=cache_position,
                     conv_cache=conv_cache[:, i] if conv_cache is not None else None,
                     recurrent_cache=recurrent_cache[:, i] if recurrent_cache is not None else None,
                 )
             else:
-                hidden_states = decoder_layer(
+                hidden_states, residual = decoder_layer(
                     hidden_states,
+                    residual,
                     position_embeddings=position_embeddings,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
@@ -691,7 +696,7 @@ class Qwen3_5TextModel(nn.Module):
                     v_cache=v_cache[:, i] if v_cache is not None else None,
                 )
 
-        hidden_states = self.norm(hidden_states)
+        hidden_states, residual = self.norm(X=hidden_states, R=residual)
         
         return hidden_states
 
