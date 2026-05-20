@@ -11,7 +11,7 @@ import torch
 APP_NAME = "qwen-b200-baremetal"
 CACHE_DIR = "/root/.cache/huggingface"
 MODEL_ID = "Qwen/Qwen3.5-9B"
-DEFAULT_GPU = os.environ.get("MODAL_GPU", "B200")
+DEFAULT_GPU = "B200"
 TORCH_VERSION = "2.7.0"
 TORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu128"
 MAX_SEQUENCE_LENGTH = 8192

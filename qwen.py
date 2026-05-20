@@ -371,13 +371,19 @@ class Qwen3_5Attention(nn.Module):
         keys_to_attend = keys_to_attend.transpose(1, 2)
         values_to_attend = values_to_attend.transpose(1, 2)
 
+        # With a KV cache, the decode step only passes past/current tokens in
+        # `keys_to_attend`. For q_len=1 and kv_len>1, PyTorch's rectangular
+        # `is_causal=True` mask aligns to the upper-left corner and would let
+        # the token attend only to key 0. Keep causal masking for prompt
+        # prefill, but disable it for cached single-token decode.
+        use_causal_mask = attention_mask is None and seq_len > 1
         attn_output = F.scaled_dot_product_attention(
             query_states,
             keys_to_attend,
             values_to_attend,
             attn_mask=attention_mask,
             dropout_p=0.0 if not self.training else self.attention_dropout,
-            is_causal=attention_mask is None,
+            is_causal=use_causal_mask,
             scale=self.scaling,
         )
         attn_weights = None
