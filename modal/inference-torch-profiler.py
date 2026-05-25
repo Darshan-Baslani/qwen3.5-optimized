@@ -11,11 +11,14 @@ import torch
 
 APP_NAME = "qwen-b200-baremetal-profiler"
 CACHE_DIR = "/root/.cache/huggingface"
+MODEL_DIR = "/root/models/Qwen-Qwen3.5-9B"
 MODEL_ID = "Qwen/Qwen3.5-9B"
 DEFAULT_GPU = os.environ.get("MODAL_GPU", "B200")
-TORCH_VERSION = "2.7.0"
+TORCH_VERSION = "2.8.0"
 TORCH_CUDA_INDEX = "https://download.pytorch.org/whl/cu128"
 MAX_SEQUENCE_LENGTH = 8192
+FLASH_QLA_PYTHONPATH = "/root/kernels/FlashQLA"
+MODEL_ALLOW_PATTERNS = ("*.json", "*.safetensors", "*.model", "*.tiktoken")
 
 PREFIX_REWRITES = (
     ("model.language_model.", "model."),
@@ -27,7 +30,8 @@ SKIP_WEIGHT_PATTERNS = ("visual", "audio", "vision_model", "mtp")
 
 
 app = modal.App(APP_NAME)
-volume = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
+cache_volume = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
+model_volume = modal.Volume.from_name("qwen35-model-weights", create_if_missing=True)
 
 
 image = (
@@ -38,6 +42,8 @@ image = (
         "setuptools",
         "packaging",
         "ninja",
+        "apache-tvm-ffi==0.1.9",
+        "tilelang==0.1.8",
         f"torch=={TORCH_VERSION}",
         "transformers",
         "huggingface_hub",
@@ -49,6 +55,7 @@ image = (
             "MAX_JOBS": "4",
             "CACHE_BUSTER": "3",
             "CUDA_LAUNCH_BLOCKING": "1",
+            "PYTHONPATH": f"/root:{FLASH_QLA_PYTHONPATH}",
         }
     )
     .add_local_file("./qwen.py", remote_path="/root/qwen.py")
@@ -78,6 +85,34 @@ def load_text_config(checkpoint_dir: str) -> dict:
     with open(config_path, "r") as f:
         hf_config = json.load(f)
     return hf_config.get("text_config", hf_config)
+
+
+def model_snapshot_ready(checkpoint_dir: str) -> bool:
+    return (
+        os.path.exists(os.path.join(checkpoint_dir, "config.json"))
+        and os.path.exists(os.path.join(checkpoint_dir, "tokenizer.json"))
+        and bool(glob.glob(os.path.join(checkpoint_dir, "*.safetensors")))
+    )
+
+
+def ensure_model_snapshot(logger: logging.Logger) -> str:
+    from huggingface_hub import snapshot_download
+
+    if model_snapshot_ready(MODEL_DIR):
+        logger.info("Using model snapshot from Modal volume: %s", MODEL_DIR)
+        return MODEL_DIR
+
+    logger.info("Model snapshot missing from Modal volume, downloading %s", MODEL_ID)
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    snapshot_download(
+        repo_id=MODEL_ID,
+        cache_dir=CACHE_DIR,
+        local_dir=MODEL_DIR,
+        allow_patterns=list(MODEL_ALLOW_PATTERNS),
+    )
+    model_volume.commit()
+    logger.info("Stored model snapshot in Modal volume: %s", MODEL_DIR)
+    return MODEL_DIR
 
 
 def build_model_config(text_cfg: dict):
@@ -161,7 +196,7 @@ def load_model_weights(model, checkpoint_dir: str, logger: logging.Logger) -> No
 @app.function(
     gpu=DEFAULT_GPU,
     image=image,
-    volumes={CACHE_DIR: volume},
+    volumes={CACHE_DIR: cache_volume, MODEL_DIR: model_volume},
     timeout=3600,
 )
 def profile_inference(
@@ -169,7 +204,6 @@ def profile_inference(
     max_new_tokens: int = 150,
     profile_decode_tokens: int | None = 16,
 ):
-    from huggingface_hub import snapshot_download
     from transformers import AutoTokenizer
 
     from qwen import Qwen3_5ForCausalLM, generate_profiled
@@ -179,11 +213,7 @@ def profile_inference(
 
     logger.info("Initializing container on %s", torch.cuda.get_device_name(device))
 
-    checkpoint_dir = snapshot_download(
-        repo_id=MODEL_ID,
-        cache_dir=CACHE_DIR,
-        allow_patterns=["*.safetensors", "*.json"],
-    )
+    checkpoint_dir = ensure_model_snapshot(logger)
 
     text_cfg = load_text_config(checkpoint_dir)
     model_config = build_model_config(text_cfg)
@@ -194,14 +224,27 @@ def profile_inference(
     model.eval()
     logger.info("Model loaded")
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, cache_dir=CACHE_DIR)
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir, local_files_only=True)
     input_ids = torch.tensor([tokenizer(prompt).input_ids], dtype=torch.long, device=device)
+
+    logger.info("Running warmup generation to trigger TileLang JIT")
+    with torch.no_grad():
+        _ = generate_profiled(
+            model=model,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            max_seq_len=min(model_config.max_position_embeddings, MAX_SEQUENCE_LENGTH),
+            profile_decode_tokens=profile_decode_tokens,
+            profiler=None,
+        )
+    torch.cuda.synchronize(device)
 
     logger.info(
         "Profiling prefill and %s decode tokens (generation target: %s tokens)",
         profile_decode_tokens if profile_decode_tokens is not None else max_new_tokens,
         max_new_tokens,
     )
+    torch.cuda.synchronize(device)
     start_time = time.time()
 
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp_trace:
@@ -227,6 +270,7 @@ def profile_inference(
                 profile_decode_tokens=profile_decode_tokens,
                 profiler=profiler,
             )
+            torch.cuda.synchronize(device)
             profiler.export_chrome_trace(trace_path)
 
         total_time = time.time() - start_time

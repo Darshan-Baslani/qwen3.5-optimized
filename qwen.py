@@ -4,9 +4,13 @@ from typing import List
 
 import torch
 import torch.nn.functional as F
-from torch import nn
+from torch import chunk, nn
 
 from kernels.triton.fused_zero_centered_rmsnorm import FusedZeroCenteredRMSNorm
+# from kernels.FlashQLA.flash_qla import chunk_gated_delta_rule
+from kernels.linear_attention.decode import gdn_decode
+from kernels.linear_attention.prefill import gdn_prefill
+
 
 
 def _apply_activation(x: torch.Tensor, activation: str | None) -> torch.Tensor:
@@ -455,8 +459,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         self.causal_conv1d_fn = pytorch_causal_conv1d_fn
         self.causal_conv1d_update = pytorch_causal_conv1d_update
-        self.chunk_gated_delta_rule = pytorch_chunk_gated_delta_rule
-        self.recurrent_gated_delta_rule = pytorch_recurrent_gated_delta_rule
+        self.chunk_gated_delta_rule = gdn_prefill
+        self.recurrent_gated_delta_rule = gdn_decode
 
         self.in_proj_qkv = nn.Linear(self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)
         self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
@@ -509,35 +513,63 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
 
         # STEP 2: PREPARE Q, K, V
-        mixed_qkv = mixed_qkv.transpose(1, 2)
+        # FlashQLA kernels require the per-head feature dimension to be unit-stride.
+        mixed_qkv = mixed_qkv.transpose(1, 2).contiguous()
         query, key, value = torch.split(
             mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1
         )
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
 
         query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
         key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
         value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
 
-        beta = b.sigmoid()
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-        
-        if self.num_v_heads // self.num_k_heads > 1:
-            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-
         # STEP 3: RECURRENT DELTA RULE (The core SSM math)
+        query = _l2_normalize_last_dim(query, eps=1e-6)
+        key = _l2_normalize_last_dim(key, eps=1e-6)
+
         if not is_decode:
-            # PREFILL: Process the whole prompt. 
+            # PREFILL: flatten packed tokens and build uniform cu_seqlens.
+            cu_seqlens = torch.arange(
+                0,
+                (batch_size + 1) * seq_len,
+                seq_len,
+                dtype=torch.int32,
+                device=query.device,
+            )
             core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
-                query, key, value, g=g, beta=beta, initial_state=None,
-                output_final_state=True, use_qk_l2norm_in_kernel=True,
+                query.reshape(-1, query.shape[-2], query.shape[-1]).contiguous(),
+                key.reshape(-1, key.shape[-2], key.shape[-1]).contiguous(),
+                value.reshape(-1, value.shape[-2], value.shape[-1]).contiguous(),
+                layer_recurrent_cache,
+                self.A_log,
+                a.reshape(-1, a.shape[-1]).contiguous(),
+                self.dt_bias,
+                b.reshape(-1, b.shape[-1]).contiguous(),
+                cu_seqlens,
+                None,
+                None,
+                None,
             )
+            core_attn_out = core_attn_out.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
         else:
-            # DECODE: Use the static recurrent matrix from the previous step
+            # DECODE: process one token per sequence against the recurrent cache.
             core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
-                query, key, value, g=g, beta=beta, initial_state=layer_recurrent_cache,
-                output_final_state=True, use_qk_l2norm_in_kernel=True,
+                query[:, 0].contiguous(),
+                key[:, 0].contiguous(),
+                value[:, 0].contiguous(),
+                layer_recurrent_cache,
+                self.A_log,
+                a[:, 0].contiguous(),
+                self.dt_bias,
+                b[:, 0].contiguous(),
+                None,
+                None,
+                None,
             )
+            core_attn_out = core_attn_out.unsqueeze(1)
 
         # Update the static recurrent cache in-place for the next token
         if layer_recurrent_cache is not None:
