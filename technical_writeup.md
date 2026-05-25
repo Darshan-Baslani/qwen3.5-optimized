@@ -54,13 +54,13 @@ The goal was never to build a production serving system. It was to understand, f
 
 ```mermaid
 graph LR
-    subgraph Local["🏠 Local Development"]
+    subgraph Local["Local Development"]
         GPU1["GTX 1650<br/>4GB VRAM<br/>Turing SM75"]
         DEV["Functional correctness<br/>Kernel compilation<br/>Numerical validation"]
         GPU1 --> DEV
     end
 
-    subgraph Cloud["☁️ Modal Cloud"]
+    subgraph Cloud["Modal Cloud"]
         GPU2["NVIDIA B200<br/>192GB HBM3e<br/>Blackwell SM100"]
         PERF["Throughput benchmarks<br/>Profiler traces<br/>Production metrics"]
         GPU2 --> PERF
@@ -105,8 +105,7 @@ Three traces were captured at key milestones to diagnose bottlenecks.
 
 Before writing a single kernel, I needed to understand *where the time was actually going*. I deployed the pure-PyTorch model to the B200 and captured a full profiler trace.
 
-> [!NOTE]
-> **📸 Profiler Screenshot Placeholder** — Initial trace showing decode step breakdown. Insert Chrome trace screenshot of `initial_trace.json` here, zoomed into a single decode step showing the waterfall of tiny CUDA kernels.
+![Initial trace showing a single decode step and the cascade of tiny CUDA kernels](traces/images/initial_trace.jpg)
 
 The trace revealed a devastating pattern. A single decode step — which should be a clean pipeline of matrix multiplications — was instead a chaotic cascade of **dozens of tiny CUDA kernels**:
 
@@ -291,8 +290,7 @@ This required modifying the weight loading logic to duplicate `input_layernorm.w
 
 ### Performance Milestone 1
 
-> [!NOTE]
-> **📸 Profiler Screenshot Placeholder** — Insert Chrome trace screenshot of `fused_rms_norm.json` here, showing the reduced kernel launch density compared to the initial trace.
+![Profiler trace after applying fused RMSNorm, showing reduced kernel launch density](traces/images/fused_rms_norm.png)
 
 | Implementation | Throughput (B200, 150 tokens) |
 |---|---|
@@ -362,13 +360,18 @@ for i in range(total_sequence_length // chunk_size):
     )
 ```
 
-**Every iteration** of this loop:
-1. Reads the state matrix $H$ (128×128 × fp32 = 64 KB per head × 32 heads = **2 MB**) from HBM
-2. Performs a few small matmuls
-3. Writes the updated state back to HBM
-4. Returns to Python for the next iteration
+**Every iteration** of this loop performs a round-trip to High Bandwidth Memory (HBM):
+1. **Reads** the recurrent state matrix $H$ from HBM:
+   $$\text{State Size} = 128 \times 128 \text{ elements} \times 4 \text{ bytes (fp32)} = 64\text{ KB per head}$$
+   $$64\text{ KB} \times 32\text{ heads} = 2\text{ MB per layer}$$
+2. Performs a few small matrix multiplications (matmuls).
+3. **Writes** the updated 2 MB state matrix back to HBM.
+4. Returns execution control to Python for the next iteration.
 
-For a 512-token prefill with chunk_size=64, that's 8 sequential iterations × 2 MB reads + 2 MB writes = **32 MB of redundant HBM traffic** — for data that could have stayed in the GPU's ~228 KB shared memory the entire time.
+For a prefill sequence of 512 tokens with a chunk size of 64, we process $\frac{512}{64} = 8$ chunks sequentially. The total redundant HBM traffic is:
+$$\text{Total HBM Traffic} = 8 \text{ chunks} \times (2\text{ MB read} + 2\text{ MB write}) = 32\text{ MB}$$
+
+This is **32 MB of redundant HBM traffic** per layer—for data that could have stayed entirely in the GPU's SRAM (shared memory, which is ~228 KB on local development hardware) the entire time.
 
 ### The Triton Solution: Chunkwise GDN with Persistent State
 
@@ -518,8 +521,7 @@ def gdn_decode_kernel(...):
 
 ### Performance Milestone 2
 
-> [!NOTE]
-> **📸 Profiler Screenshot Placeholder** — Insert Chrome trace screenshot of `triton_linear_attention.json` here, showing the dramatically cleaner decode step with fused GDN kernel calls replacing the Python for-loop cascade.
+![Profiler trace with fused GDN kernels, showing a clean decode step free of Python loop overhead](traces/images/triton_linear_attention.png)
 
 | Implementation | End-to-End Time (150 tok) | Throughput |
 |---|---|---|
@@ -538,11 +540,11 @@ This project required evaluating three kernel authoring frameworks:
 ```mermaid
 graph LR
     subgraph Spectrum["Abstraction Level vs. Peak Performance"]
-        TRITON["Triton<br/>━━━━━━━━━<br/>✅ Rapid iteration<br/>✅ Portable across GPUs<br/>⚠️ Limited TMA control<br/>⚠️ Compiler quirks on B200"]
+        TRITON["Triton<br/>━━━━━━━━━<br/>+ Rapid iteration<br/>+ Portable across GPUs<br/>- Limited TMA control<br/>- Compiler quirks on B200"]
 
-        TILELANG["TileLang (FlashQLA)<br/>━━━━━━━━━<br/>✅ Warp specialization<br/>✅ Better occupancy control<br/>⚠️ Newer ecosystem<br/>⚠️ Build complexity"]
+        TILELANG["TileLang (FlashQLA)<br/>━━━━━━━━━<br/>+ Warp specialization<br/>+ Better occupancy control<br/>- Newer ecosystem<br/>- Build complexity"]
 
-        CUTE["CuTe-DSL / CUTLASS<br/>━━━━━━━━━<br/>✅ Full hardware control<br/>✅ TMA + swizzle layouts<br/>❌ 3000+ line kernels<br/>❌ Weeks of development"]
+        CUTE["CuTe-DSL / CUTLASS<br/>━━━━━━━━━<br/>+ Full hardware control<br/>+ TMA + swizzle layouts<br/>- 3000+ line kernels<br/>- Weeks of development"]
     end
 
     TRITON -->|"I chose this"| RESULT["83 tok/s<br/>~1000 LOC total"]
