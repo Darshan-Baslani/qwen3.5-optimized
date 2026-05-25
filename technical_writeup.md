@@ -329,7 +329,8 @@ The recurrence relation for each token:
 $$H_{t+1} = \gamma_t \cdot H_t + k_t \otimes \beta_t \cdot (v_t - k_t^\top H_t)$$
 $$o_t = q_t^\top \cdot H_{t+1}$$
 
-Where $\gamma_t = \exp(-\exp(A_{\log}) \cdot \text{softplus}(a_t + \text{dt\_bias}))$ is a learned gating decay.
+Where the learned gating decay $\gamma_t$ is defined as:
+$$\gamma_t = \exp\left(-\exp(A_{\text{log}}) \cdot \text{softplus}(a_t + \text{dt}_{\text{bias}})\right)$$
 
 ### The Bottleneck: Sequential Loops in PyTorch
 
@@ -468,7 +469,7 @@ def _dot_f32(a, b):
 For the single-token decode kernel, things are simpler since we don't need chunking. We map the grid over batch and heads:
 
 1. Load the state tile $H[\text{BV}, K]$ from HBM (single read).
-2. Compute the gate decay value $\gamma = \exp(-\exp(A_{\log}) \cdot \text{softplus}(a + \text{dt\_bias}))$.
+2. Compute the gate decay value $\gamma = \exp\left(-\exp(A_{\text{log}}) \cdot \text{softplus}(a + \text{dt}_{\text{bias}})\right)$.
 3. Run the recurrent update step directly in registers.
 4. Write out the output token and the new state back to HBM.
 
@@ -537,7 +538,7 @@ Even with these issues, Triton was the right choice for this project:
 | Lines of Code | ~1,100 total | ~3,000+ per kernel |
 | Maintainability | High (Python-like syntax) | Low (highly complex C++ templates) |
 | Throughput | 83 tokens/s | Theoretical peak (maybe ~90 tok/s) |
-| Development Time | 2 weeks | 2+ months |
+| Development Time | 2 weeks | 2+ months(I have fulltime college :( ) |
 
 Ultimately, hitting 83 tokens/second in a couple of weeks with Triton is a much better engineering tradeoff than spending months in C++ to chase a marginal single-digit performance gain.
 
